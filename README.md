@@ -452,3 +452,131 @@ La 2.2.0 se comporte comme notre référence : aucune erreur et un p95 du même 
 
 L'incident de la 2.1.0 est analysé dans [docs/postmortem-2.1.0.md](docs/postmortem-2.1.0.md) : chronologie, les 4 preuves, la cause racine (pourquoi les probes n'ont rien vu) et les actions correctives.
 
+
+### PSSI : règles vérifiées automatiquement (Policy as Code)
+
+La mini-PSSI (`policies/pssi.md`) fixe 5 règles pour la production. Elles sont vérifiées sur chaque Pull Request, et une règle non respectée bloque le merge : on ne compte plus sur la relecture humaine pour les voir.
+
+#### Tableau des contrôles
+
+| Règle | Contrôle | Outil | Preuve |
+| --- | --- | --- | --- |
+| PSSI-R1 : tag explicite, jamais `latest` | Refus si l'image n'a pas de tag ou finit par `:latest` | conftest (job « PSSI manifests (conftest) ») | La PR avec `nginx:latest` est bloquée (capture ci-dessous) |
+| PSSI-R2 : images du registre `ghcr.io/9m7fjfpv9k-cyber/` uniquement | Refus si l'image ne commence pas par ce registre | conftest (job « PSSI manifests (conftest) ») | La même PR est bloquée : `registry.hub.docker.com/nginx` n'est pas autorisé |
+| PSSI-R3 : limite de mémoire sur chaque conteneur | Refus si un conteneur n'a pas `resources.limits.memory` | conftest (job « PSSI manifests (conftest) ») | Un manifeste de test sans limite est refusé ; notre Rollout passe (limite de 256 Mi) |
+| PSSI-R4 : pods jamais en root | Refus si le pod ne déclare pas `securityContext.runAsNonRoot: true` | conftest (job « PSSI manifests (conftest) ») | Notre Rollout échouait sur R4 avant la correction, il passe après |
+| PSSI-R5 : aucune vulnérabilité HIGH ou CRITICAL corrigeable | Scan des images TaskFlow déployées, échec à la première faille HIGH ou CRITICAL corrigeable | Trivy (job « PSSI images (Trivy) ») | 9 failles HIGH trouvées sur la 2.2.0, couvertes par une exception dans `.trivyignore` |
+
+#### Écriture de R3 et R4
+
+Au départ, seules R1 et R2 étaient écrites dans `policies/kubernetes.rego` : conftest passait donc sans rien dire sur la mémoire ni sur l'utilisateur root.
+
+```console
+$ conftest test apps/ --policy policies/
+15 tests, 15 passed, 0 warnings, 0 failures, 0 exceptions
+```
+
+Nous avons écrit les deux règles manquantes, sur le modèle de R1 et R2 :
+
+```rego
+# PSSI-R3 : limite de mémoire sur chaque conteneur.
+deny contains msg if {
+	some c in conteneurs
+	not c.resources.limits.memory
+	msg := sprintf("PSSI-R3 : le conteneur '%s' n'a pas de limite de mémoire (resources.limits.memory)", [c.name])
+}
+
+# PSSI-R4 : pods jamais en root.
+pod_non_root if {
+	input.spec.template.spec.securityContext.runAsNonRoot == true
+}
+
+deny contains msg if {
+	charges_de_travail[input.kind]
+	not pod_non_root
+	msg := sprintf("PSSI-R4 : le %s '%s' doit déclarer spec.template.spec.securityContext.runAsNonRoot: true", [input.kind, input.metadata.name])
+}
+```
+
+En relançant conftest, notre Rollout est bien refusé sur R4 (il a déjà une limite de mémoire, donc R3 passe) :
+
+```console
+$ conftest test apps/ --policy policies/
+FAIL - apps/taskflow/rollout.yaml - main - PSSI-R4 : le Rollout 'taskflow' doit déclarer spec.template.spec.securityContext.runAsNonRoot: true
+
+25 tests, 24 passed, 0 warnings, 1 failure, 0 exceptions
+```
+
+Pour vérifier que R3 bloque bien quelque chose, nous l'avons testée sur un manifeste sans limite de mémoire :
+
+```console
+$ conftest test sans-limite.yaml --policy policies/
+FAIL - sans-limite.yaml - main - PSSI-R3 : le conteneur 'app' n'a pas de limite de mémoire (resources.limits.memory)
+```
+
+#### Correction du Rollout (R4)
+
+Nous avons ajouté `runAsNonRoot: true` au niveau du pod (c'est là que R4 le cherche, et il s'applique alors à tous les conteneurs du pod). Au niveau du conteneur, nous avons aussi interdit l'élévation de privilèges :
+
+```yaml
+    spec:
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: taskflow
+          # ...
+          securityContext:
+            allowPrivilegeEscalation: false
+```
+
+L'image TaskFlow tourne déjà avec un utilisateur non root (`10001`), donc les pods démarrent sans problème. Toutes les règles passent :
+
+```console
+$ conftest test apps/ --policy policies/
+25 tests, 25 passed, 0 warnings, 0 failures, 0 exceptions
+```
+
+#### Mise en place dans la CI
+
+Nous avons copié `exemples/ci/pssi-github.yml` en `.github/workflows/pssi.yml` (PR #26). Le workflow tourne sur chaque PR vers `main` et sur chaque push sur `main`, avec deux jobs :
+
+- **PSSI manifests (conftest)** : une seule commande `conftest test apps/ --policy policies/`, qui vérifie R1 à R4 d'un coup (conftest applique toutes les règles du fichier Rego) ;
+- **PSSI images (Trivy)** : liste les images TaskFlow déployées dans `apps/`, puis les scanne avec Trivy (R5).
+
+Dans le ruleset de `main`, ces deux contrôles sont rendus obligatoires : si l'un des deux est rouge, le bouton de merge est bloqué.
+
+#### PR non conforme : le blocage
+
+Pour vérifier que la CI bloque vraiment, nous avons ouvert une PR qui remplace notre image par `registry.hub.docker.com/nginx:latest`. Comme on peut le voir, le job conftest échoue sur deux règles à la fois : R1 (tag `latest`) et R2 (image hors du registre autorisé).
+
+![CI de la PR nginx : le job PSSI manifests (conftest) échoue sur PSSI-R1 et PSSI-R2](screenshots/pssi-pr-nginx-bloquee.png)
+
+```console
+$ conftest test apps/ --policy policies/
+FAIL - apps/taskflow/rollout.yaml - main - PSSI-R1 : le conteneur 'taskflow' utilise le tag latest (registry.hub.docker.com/nginx:latest)
+FAIL - apps/taskflow/rollout.yaml - main - PSSI-R2 : l'image du conteneur 'taskflow' ne vient pas du registre autorisé (registry.hub.docker.com/nginx:latest)
+
+25 tests, 23 passed, 0 warnings, 2 failures, 0 exceptions
+```
+
+Le job Trivy reste vert sur cette PR : il ne scanne que les images de notre registre, et l'image nginx n'en fait pas partie. Ce n'est pas un trou, puisque R2 la bloque déjà en amont.
+
+#### Trivy rouge : exception dans `.trivyignore`
+
+Au premier passage de la CI, le job Trivy a échoué sur la 2.2.0 : 9 vulnérabilités HIGH corrigeables, toutes dans des bibliothèques Python (le système Debian de l'image est propre).
+
+| Bibliothèque | Version dans l'image | Failles HIGH | Version qui les corrige toutes |
+| --- | --- | --- | --- |
+| starlette | 0.41.3 | 3 (CVE-2025-62727, CVE-2026-48818, CVE-2026-54283) | 1.3.1 |
+| urllib3 | 1.26.20 | 6 (CVE-2025-66418, CVE-2025-66471, CVE-2026-21441, CVE-2026-44431, CVE-2026-97687, CVE-2026-97689) | 2.8.0 |
+
+Corriger voudrait dire reconstruire l'image avec des bibliothèques à jour, ce qui n'est pas entre nos mains (la 2.2.0 est la dernière image disponible). Nous avons donc choisi l'exception, ce que la PSSI autorise si elle est écrite et justifiée. Avant de l'accepter, nous avons vérifié dans le code de la 2.2.0 que ces failles ne sont pas exploitables chez nous :
+
+- **starlette** : les failles touchent le service de fichiers (`StaticFiles`, en-tête `Range`) et la lecture de formulaires (`request.form()`). TaskFlow ne sert aucun fichier et ne lit que du JSON.
+- **urllib3** : il n'est utilisé que par `requests`, pour le webhook de notification. Or ce webhook ne fait rien si `NOTIFY_WEBHOOK_URL` est vide, et cette variable n'est définie ni dans l'image ni dans `apps/taskflow/` : aucun appel sortant, donc rien à exploiter.
+
+Avec le `.trivyignore` (PR #26), le job Trivy repasse au vert. L'exception reste temporaire : la vraie correction est une image reconstruite avec `starlette` 1.3.1 ou plus et un `requests` récent (donc `urllib3` 2.8.0 ou plus), après quoi le fichier doit être supprimé.
+
+#### Limite constatée
+
+Les règles conftest ne regardent que les Deployment, Rollout, StatefulSet et DaemonSet. Le Job k6 de l'AnalysisTemplate utilise `grafana/k6:latest`, qui enfreint R1 et R2, mais n'est pas vérifié. Il faudrait étendre les règles aux conteneurs des AnalysisTemplate (ou épingler l'image k6 sur une version et la recopier dans notre registre).
